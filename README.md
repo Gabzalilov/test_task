@@ -1,32 +1,64 @@
 # Booking Service
 
-Backend-сервис для записи на встречи: REST API создает бронь, Celery-воркер асинхронно подтверждает ее или переводит в `failed`, Redis используется как broker/result backend, PostgreSQL хранит данные.
+Небольшой сервис для записи на встречи. API принимает заявку, сохраняет бронь в статусе `pending` и отправляет ее в очередь. Дальше Celery-воркер асинхронно подтверждает бронь или переводит ее в `failed`, если сымитирован сбой внешнего сервиса.
 
-## Запуск сервиса
+Фронтенда здесь нет: я сосредоточился на backend-части, инфраструктуре, миграциях, фоновой обработке и тестах.
 
-1. При необходимости скопируйте переменные окружения, чтобы переопределить дефолты из `docker-compose.yml`:
+## Что внутри
 
-```bash
-cp .env.example .env
-```
+- REST API на FastAPI
+- PostgreSQL как основное хранилище
+- SQLAlchemy ORM и Alembic для миграций
+- Redis как broker и result backend для Celery
+- Celery-воркер для обработки броней
+- pytest-тесты, которые запускаются без Docker
+- JSON-логи
+- простой rate limiting на создание броней
 
-2. Поднимите стек:
+## Запуск
+
+Из корня проекта:
 
 ```bash
 docker compose up --build
 ```
 
-При старте web-контейнер применяет миграции Alembic. API будет доступен на `http://localhost:8000`, Swagger UI: `http://localhost:8000/docs`.
-Если у вас установлен standalone Compose, та же команда работает как `docker-compose up --build`.
+После старта:
+
+- API: `http://localhost:8000`
+- Swagger UI: `http://localhost:8000/docs`
+
+При запуске `web`-контейнер сначала применяет миграции Alembic, потом стартует FastAPI-приложение. Файл `.env` для первого запуска не обязателен: дефолтные значения уже прописаны в `docker-compose.yml`.
+
+Если хочется переопределить настройки:
+
+```bash
+cp .env.example .env
+```
+
+Для старой standalone-версии Compose команда такая же по смыслу:
+
+```bash
+docker-compose up --build
+```
 
 ## API
 
-- `POST /bookings` - создать бронь.
-- `GET /bookings/{id}` - получить статус брони.
-- `GET /bookings?status=pending&limit=20&offset=0` - список броней с фильтром и пагинацией.
-- `DELETE /bookings/{id}` - отменить бронь, если она еще `pending`.
+### Создать бронь
 
-Пример создания:
+```http
+POST /bookings
+```
+
+```json
+{
+  "name": "Anna",
+  "datetime": "2026-07-01T10:00:00Z",
+  "service_type": "consultation"
+}
+```
+
+Пример через curl:
 
 ```bash
 curl -X POST http://localhost:8000/bookings \
@@ -34,37 +66,105 @@ curl -X POST http://localhost:8000/bookings \
   -d '{"name":"Anna","datetime":"2026-07-01T10:00:00Z","service_type":"consultation"}'
 ```
 
+Ответ возвращается сразу. Новая бронь получает статус `pending`, а подтверждение происходит уже в фоне.
+
+### Получить бронь
+
+```http
+GET /bookings/{id}
+```
+
+Возвращает бронь и ее текущий статус: `pending`, `confirmed` или `failed`.
+
+### Список броней
+
+```http
+GET /bookings?status=pending&limit=20&offset=0
+```
+
+`status` необязателен. Можно фильтровать по `pending`, `confirmed` и `failed`. Для пагинации используются `limit` и `offset`.
+
+### Отменить бронь
+
+```http
+DELETE /bookings/{id}
+```
+
+Отменить можно только бронь в статусе `pending`. Если воркер уже успел ее обработать, API вернет `409 Conflict`.
+
+## Как работает воркер
+
+Основной сценарий такой:
+
+1. API создает запись в БД со статусом `pending`.
+2. В Celery отправляется задача с `booking_id`.
+3. Воркер забирает бронь из БД.
+4. Если бронь все еще `pending`, он пытается ее обработать.
+5. При успехе статус меняется на `confirmed`, после этого логируется mock-уведомление.
+6. При временном сбое задача уходит на retry с backoff.
+7. Если попытки закончились, бронь переводится в `failed`.
+
+Идемпотентность здесь завязана на статус. Воркер меняет только `pending`-бронь. Если задачу по тому же `booking_id` запустить повторно после `confirmed` или `failed`, она ничего не сломает и не отправит уведомление второй раз.
+
 ## Тесты
 
-Тесты не требуют Docker, PostgreSQL или Redis:
+Тесты запускаются без PostgreSQL, Redis и Docker:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-В тестах используется временная SQLite-база, а отправка задачи в очередь мокается на уровне API. Логика воркера проверяется отдельно с мокнутой отправкой уведомления.
+Для тестов используется временная SQLite-база. Очередь в API-тестах мокается, чтобы не требовать запущенный Redis и Celery. Логика воркера проверяется отдельно: есть тест на успешное подтверждение, идемпотентный повторный запуск и перевод брони в `failed`.
 
-## Технические решения
+## Почему так
 
-- **FastAPI + Pydantic**: легкий REST API с автодокументацией и понятной валидацией входных данных.
-- **SQLAlchemy ORM + Alembic**: ORM закрывает работу с хранилищем без прямого SQL, Alembic дает воспроизводимые миграции для PostgreSQL.
-- **Celery + Redis**: классический стек для фоновой обработки; API только создает `pending`-бронь и ставит `booking_id` в очередь.
-- **Идемпотентность воркера**: задача обрабатывает только `pending`-бронь. Если запись уже `confirmed` или `failed`, повторный запуск ничего не меняет и не отправляет повторное уведомление.
-- **Retry с backoff**: имитация внешнего сбоя вызывает retry с экспоненциальной задержкой. Если попытки исчерпаны, бронь переводится в `failed`.
-- **Structured logging**: приложение пишет JSON-логи с полями вроде `booking_id`, `status`, `service_type`.
-- **Rate limiting**: `POST /bookings` ограничен простым in-memory лимитом на IP, значение задается через `POST_BOOKINGS_RATE_LIMIT_PER_MINUTE`.
+**FastAPI** взял из-за простого REST API, встроенной OpenAPI-документации и нормальной валидации через Pydantic.
 
-## Структура
+**SQLAlchemy ORM + Alembic** дают понятную модель данных и воспроизводимые миграции. В бизнес-логике нет прямых SQL-запросов.
+
+**Celery + Redis** хорошо подходят для такого сценария: API быстро отвечает клиенту, а вся потенциально медленная обработка уезжает в фон.
+
+**SQLite в тестах** нужен только для удобства локального запуска. В рабочем Docker-стеке используется PostgreSQL.
+
+**Retry с backoff** добавлен потому, что сбой внешнего сервиса обычно временный. После последней неудачной попытки статус становится `failed`.
+
+**Rate limiting** сделан простым in-memory вариантом. Для тестового сервиса этого достаточно; в production я бы вынес такой лимит в Redis или на уровень API gateway.
+
+## Переменные окружения
+
+Основные настройки лежат в `.env.example`:
+
+- `DATABASE_URL`
+- `CELERY_BROKER_URL`
+- `CELERY_RESULT_BACKEND`
+- `BOOKING_FAILURE_RATE`
+- `POST_BOOKINGS_RATE_LIMIT_PER_MINUTE`
+- `LOG_LEVEL`
+
+## Структура проекта
 
 ```text
 app/
-  main.py          # FastAPI routes
-  models.py        # SQLAlchemy model and statuses
+  main.py          # REST API
+  models.py        # SQLAlchemy models
   schemas.py       # Pydantic schemas
   tasks.py         # Celery worker logic
-  database.py      # engine/session setup
-  config.py        # environment settings
-alembic/           # migrations
-tests/             # pytest suite
+  database.py      # DB engine and sessions
+  config.py        # settings
+  logging.py       # JSON logging
+  rate_limit.py    # simple in-memory rate limiter
+alembic/
+  versions/        # migrations
+tests/             # pytest tests
 ```
+
+## Команды
+
+```bash
+make dev
+make test
+make lint
+```
+
+`make lint` здесь запускает `compileall`. Отдельный линтер я не добавлял, чтобы не раздувать небольшое тестовое задание лишней конфигурацией.
